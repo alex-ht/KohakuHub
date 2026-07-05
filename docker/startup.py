@@ -7,7 +7,14 @@ import subprocess
 from pathlib import Path
 
 
-CRED_FILE = Path("/hub-api-creds/credentials.env")
+# Support configurable credentials file location (important for all-in-one)
+# Default keeps backward compat with existing docker-compose volumes.
+CRED_FILE = Path(
+    os.getenv(
+        "CRED_FILE",
+        os.getenv("KOHAKU_HUB_CREDS_FILE", "/hub-api-creds/credentials.env"),
+    )
+)
 LAKEFS_ENDPOINT = os.getenv("KOHAKU_HUB_LAKEFS_ENDPOINT", "http://lakefs:28000")
 ADMIN_USER = os.getenv("LAKEFS_ADMIN_USER", "admin")
 

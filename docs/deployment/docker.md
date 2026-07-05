@@ -138,3 +138,11 @@ docker-compose down
 - **API Docs**: `http://localhost:48888/docs`
 - **LakeFS UI**: `http://localhost:28000`
 - **MinIO Console**: `http://localhost:29000`
+
+## Alternative: All-in-One Single Container
+
+If you want the simplest possible deployment (everything in **one** container), see the dedicated guide:
+
+→ [All-in-One Docker Deployment](./all-in-one.md)
+
+This bundles MinIO + LakeFS + Nginx + the API into a single image. All data can be backed up by mounting a single volume (`/data`). It is ideal for demos and small personal instances.

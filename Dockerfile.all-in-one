@@ -1,0 +1,142 @@
+# =============================================================================
+# KohakuHub All-in-One Dockerfile
+#
+# Produces a SINGLE container that runs:
+#   - MinIO (S3 storage)
+#   - LakeFS (versioning)
+#   - Nginx (frontend + reverse proxy)
+#   - KohakuHub API (FastAPI + uvicorn)
+#
+# Design goals:
+#   - Easy backup: everything persistent lives under /data (or KOHAKU_DATA_DIR)
+#   - Simple usage: docker run -v /host/path:/data -p 28080:80 ...
+#   - Self-contained: frontend is built inside the image
+#
+# Usage example:
+#   docker build -f Dockerfile.all-in-one -t kohakuhub:all-in-one .
+#   docker run -d -p 28080:80 -v $PWD/kh-data:/data kohakuhub:all-in-one
+#
+# Backup:
+#   Stop the container, then tar/backup the entire mounted directory.
+#   To restore: mount the same directory to a fresh container.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Stage 1: Build frontend (UI + Admin)
+# -----------------------------------------------------------------------------
+FROM node:20-slim AS frontend-builder
+
+WORKDIR /build
+
+# Enable pnpm via corepack
+RUN corepack enable && corepack prepare pnpm@latest --activate
+
+# Copy package manifests for efficient install (pnpm workspace)
+COPY package.json pnpm-workspace.yaml ./
+COPY src/kohaku-hub-ui/package.json ./src/kohaku-hub-ui/
+COPY src/kohaku-hub-admin/package.json ./src/kohaku-hub-admin/
+
+# Copy lockfiles if present (they exist in this repo)
+COPY src/kohaku-hub-ui/package-lock.json ./src/kohaku-hub-ui/
+COPY src/kohaku-hub-admin/package-lock.json ./src/kohaku-hub-admin/
+
+# Configure pnpm for reliable resolution in Docker (hoisted layout helps CSS subpath imports like @unocss/reset)
+RUN printf "shamefully-hoist=true\nnode-linker=hoisted\n" > .npmrc && \
+    pnpm install --no-frozen-lockfile --shamefully-hoist || pnpm install
+
+# Explicitly ensure @unocss/reset is present (direct import in main.js sometimes not resolved in strict pnpm Docker layouts)
+RUN pnpm add -D @unocss/reset --filter kohaku-hub-ui || pnpm --filter kohaku-hub-ui add @unocss/reset
+
+# Copy full frontend sources 
+COPY src/kohaku-hub-ui ./src/kohaku-hub-ui
+COPY src/kohaku-hub-admin ./src/kohaku-hub-admin
+
+# Copy root-level assets required by the prebuild.cjs scripts
+# (docs/, images/ logos, and some markdown files referenced for documentation tab)
+COPY docs ./docs
+COPY images ./images
+COPY CONTRIBUTING.md LICENSING.md ./
+
+RUN pnpm run build
+
+# -----------------------------------------------------------------------------
+# Stage 2: Final runtime image
+# -----------------------------------------------------------------------------
+FROM python:3.13-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    # Default data dir (user should mount a volume here)
+    KOHAKU_DATA_DIR=/data
+
+# System dependencies: nginx, supervisor, curl (for downloading binaries), etc.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        nginx \
+        supervisor \
+        curl \
+        ca-certificates \
+        gettext-base \
+        && rm -rf /var/lib/apt/lists/*
+
+# Install uv (same as main Dockerfile)
+RUN pip install --no-cache-dir uv
+
+WORKDIR /app
+
+# Copy Python project metadata and install deps (editable first for caching)
+COPY ./pyproject.toml .
+RUN mkdir -p /app/src/kohakuhub && \
+    echo "" > /app/src/kohakuhub/__init__.py && \
+    uv pip install --system -e .
+
+# Copy application code
+COPY ./src/kohakuhub ./src/kohakuhub
+COPY ./scripts ./scripts
+COPY ./docker/startup.py /app/startup.py
+RUN chmod +x /app/startup.py
+
+# -----------------------------------------------------------------------------
+# Download MinIO + LakeFS binaries (pinned versions recommended)
+# -----------------------------------------------------------------------------
+ARG MINIO_VERSION=latest
+ARG LAKEFS_VERSION=v1.52.0
+
+# MinIO binary
+RUN curl -sSL -o /usr/local/bin/minio \
+        https://dl.min.io/server/minio/release/linux-amd64/minio && \
+    chmod +x /usr/local/bin/minio
+
+# LakeFS binary (adjust asset name if GitHub changes format)
+RUN set -eux; \
+    LAKEFS_TAR="lakefs_${LAKEFS_VERSION#v}_Linux_x86_64.tar.gz"; \
+    curl -sSL -L -o /tmp/lakefs.tar.gz \
+        "https://github.com/treeverse/lakeFS/releases/download/${LAKEFS_VERSION}/${LAKEFS_TAR}"; \
+    tar -xzf /tmp/lakefs.tar.gz -C /usr/local/bin lakefs; \
+    chmod +x /usr/local/bin/lakefs; \
+    rm -f /tmp/lakefs.tar.gz
+
+# -----------------------------------------------------------------------------
+# Frontend static files
+# -----------------------------------------------------------------------------
+COPY --from=frontend-builder /build/src/kohaku-hub-ui/dist /usr/share/nginx/html
+COPY --from=frontend-builder /build/src/kohaku-hub-admin/dist /usr/share/nginx/html-admin
+
+# All-in-One specific configs
+COPY docker/all-in-one/nginx.conf /etc/nginx/conf.d/default.conf
+COPY docker/all-in-one/supervisord.conf /etc/supervisor/supervisord.conf
+COPY docker/all-in-one/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Expose only the main port (nginx). Others are internal.
+# You can still publish them if needed: -p 29001:9000 -p 28000:28000
+EXPOSE 80
+
+# Data volume for easy backup
+VOLUME ["/data"]
+
+# Use our entrypoint (sets env + dirs + launches supervisord)
+ENTRYPOINT ["/entrypoint.sh"]
+
+# Healthcheck (simple; hits the public port)
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost/ || exit 1
